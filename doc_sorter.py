@@ -9,6 +9,7 @@ import base64
 from io import BytesIO
 from PIL import Image
 import pypdfium2
+import sys
 
 load_dotenv()
 
@@ -29,6 +30,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 def extract_text_with_pypdf(pdf_path):
     """Extracts text from a PDF using PyPDF (fast, free)."""
+    print(f"🔍 Trying PyPDF to extract data from {pdf_path}...")
     try:
         with open(pdf_path, "rb") as f:
             reader = pypdf.PdfReader(f)
@@ -49,50 +51,60 @@ def encode_image(image):
 
 
 def extract_text_with_gpt4_vision(pdf_path):
-    """Extracts printed & handwritten text from a scanned PDF using GPT-4 Vision."""
+    """Extracts text from a scanned PDF using GPT-4 Vision with a single stacked image."""
+    print(f"🔍 Trying GPT4 for {pdf_path}...")
     try:
-        pdf = pypdfium2.PdfDocument(pdf_path)
-        text_results = []
+        pdf = pypdfium2.PdfDocument(pdf_path)  # Open PDF
+        images = [
+            page.render(scale=2.0).to_pil() for page in pdf
+        ]  # Convert pages to images
+        pdf.close()  # ✅ Explicitly close the file to prevent Windows file locks
 
-        for i in range(len(pdf)):
-            page = pdf[i]
-            bitmap = page.render(scale=2.0)  # Convert to high-res image
-            pil_image = bitmap.to_pil()  # Convert to PIL image
+        if not images:
+            print(f"🚨 No images rendered for {pdf_path}. Skipping.")
+            return ""
 
-            # Encode image to Base64 for OpenAI
-            encoded_image = encode_image(pil_image)
+        # Stack images vertically into one single image
+        total_width = max(img.width for img in images)
+        total_height = sum(img.height for img in images)
+        combined_image = Image.new("RGB", (total_width, total_height))
 
-            client = openai.OpenAI()
+        y_offset = 0
+        for img in images:
+            combined_image.paste(img, (0, y_offset))
+            y_offset += img.height  # Move down for the next page
 
-            # Send to OpenAI GPT-4 Vision for OCR
-            response = client.chat.completions.create(
-                model="gpt-4-vision-preview",
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "Extract all handwritten and printed text from this document.",
-                    },
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": "Extract text from this document page.",
+        # Convert combined image to base64
+        encoded_image = encode_image(combined_image)
+
+        client = openai.OpenAI()
+
+        # Send to OpenAI GPT-4 Vision (Latest API)
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "Extract all printed and handwritten text from this document.",
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Extract text from this document."},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{"image/png"};base64,{encoded_image}"
                             },
-                            {
-                                "type": "image_url",
-                                "image_url": f"data:image/png;base64,{encoded_image}",
-                            },
-                        ],
-                    },
-                ],
-            )
+                        },
+                    ],
+                },
+            ],
+        )
 
-            # Extract text from OpenAI's response
-            extracted_text = response["choices"][0]["message"]["content"].strip()
-            text_results.append(extracted_text)
-
-        return "\n".join(text_results)
+        # Extract text from OpenAI response
+        extracted_text = response.choices[0].message.content.strip()
+        return extracted_text
 
     except Exception as e:
         print(f"🚨 GPT-4 Vision OCR failed for {pdf_path}: {e}")
@@ -107,21 +119,21 @@ def redact_sensitive_info(text):
     return text
 
 
-def extract_text_from_pdf(pdf_path):
-    """Hybrid PDF OCR: Tries PyPDF first, falls back to GPT-4 Vision if needed."""
-    print(f"🔍 Trying pypdf for {pdf_path}...")
-    extracted_text = extract_text_with_pypdf(pdf_path)
+# def extract_text_from_pdf(pdf_path):
+#     """Hybrid PDF OCR: Tries PyPDF first, falls back to GPT-4 Vision if needed."""
+#     print(f"🔍 Trying pypdf for {pdf_path}...")
+#     extracted_text = extract_text_with_pypdf(pdf_path)
 
-    if (
-        extracted_text and len(extracted_text) > 50
-    ):  # Ensures text isn't empty or too short
-        print(f"✅ pypdf succeeded for {pdf_path} (Skipping GPT-4 Vision)")
-        return extracted_text
-    else:
-        print(
-            f"⚠️ pypdf failed or returned bad data for {pdf_path} (Using GPT-4 Vision)..."
-        )
-        return extract_text_with_gpt4_vision(pdf_path)
+#     if (
+#         extracted_text and len(extracted_text) > 50
+#     ):  # Ensures text isn't empty or too short
+#         print(f"✅ pypdf succeeded for {pdf_path} (Skipping GPT-4 Vision)")
+#         return extracted_text
+#     else:
+#         print(
+#             f"⚠️ pypdf failed or returned bad data for {pdf_path} (Using GPT-4 Vision)..."
+#         )
+#         return extract_text_with_gpt4_vision(pdf_path)
 
 
 def get_unique_filename(directory, filename):
@@ -137,11 +149,9 @@ def get_unique_filename(directory, filename):
     return new_filename
 
 
-def get_llm_metadata(pdf_path):
+def get_llm_metadata(text):
     """Sends extracted text to the LLM and returns structured metadata."""
     try:
-        text = extract_text_from_pdf(pdf_path)
-
         # Inject PDF text into the prompt
         prompt = DOCUMENT_PROMPT.replace("{PDF_TEXT}", text[:3000])
 
@@ -159,7 +169,7 @@ def get_llm_metadata(pdf_path):
             return None
 
     except Exception as e:
-        print(f"🚨 Error communicating with LLM for {pdf_path}: {e}")
+        print(f"🚨 Error communicating with LLM: {e}")
         return None
 
 
@@ -195,28 +205,45 @@ def process_pdfs():
     for filename in os.listdir(INPUT_DIR):
         if filename.lower().endswith(".pdf"):
             file_path = os.path.join(INPUT_DIR, filename)
-            print(f"Processing {filename}...")
-
-            try:
-                # Get LLM response
-                ai_response = get_llm_metadata(file_path)
-                if not ai_response:
-                    print(f"⚠️ Skipping {filename} due to LLM error.")
-                    continue
-
-                # Check if the file is unreadable and should be skipped
-                if is_unreadable(ai_response):
-                    print(f"⚠️ LLM marked {filename} as unreadable. Skipping.")
-                    continue
-
-                # Move and rename the file
-                move_pdf(file_path, ai_response)
-
-            except Exception as e:
-                print(f"🚨 Error processing {filename}: {e}")
+            process_pdf(file_path)
+            print()
         else:
             print(f"Skipping {filename}...")
 
 
+def process_pdf(filename):
+    print(f"Processing {filename}...")
+
+    try:
+        # Get LLM response
+        text = extract_text_with_pypdf(filename)
+        ai_response = get_llm_metadata(text)
+        if not ai_response:
+            print(f"⚠️ Skipping {filename} due to LLM error.")
+            return None
+
+        if (
+            "unknown" in str(ai_response).lower()
+            or "unidentified" in str(ai_response).lower()
+        ):
+            print(ai_response)
+            text = extract_text_with_gpt4_vision(filename)
+            ai_response = get_llm_metadata(text)
+
+        # Check if the file is unreadable and should be skipped
+        if is_unreadable(ai_response):
+            print(f"⚠️ LLM marked {filename} as unreadable. Skipping.")
+            return None
+
+        # Move and rename the file
+        move_pdf(filename, ai_response)
+
+    except Exception as e:
+        print(f"🚨 Error processing {filename}: {e}")
+
+
 if __name__ == "__main__":
-    process_pdfs()
+    if len(sys.argv) > 1:
+        process_pdf(sys.argv[1])
+    else:
+        process_pdfs()
